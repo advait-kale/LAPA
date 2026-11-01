@@ -1,16 +1,9 @@
-from typing import Literal
-from platform import node
+from typing import Literal, TypedDict
 import os
 from pathlib import Path
-from IPython.display import Image, display
-from langchain.tools import tool
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Optional, Set, List
-from langchain.chat_models import init_chat_model
 from langchain_groq import ChatGroq
-from typing_extensions import Annotated, List
-import operator
 from langchain.messages import HumanMessage, SystemMessage
 
 # Load the Groq key from the project-root .env without adding a runtime dependency.
@@ -38,30 +31,36 @@ if not groq_api_key:
         "Groq API key not found. Add GROQ_API_KEY=<your key> to the project-root .env file."
     )
 
+
 llm = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=groq_api_key,
     temperature=0.7,
 )
 
-# sender
-# to
-# subject
-# msg_plain
-# msg_html
 
-#state
+class AssistantState(TypedDict, total=False):
+    """Shared state passed between orchestrator graph nodes."""
+
+    query: str
+    sender: str
+    intent: Literal["email", "calendar", "general"]
+    to: str
+    subject: str
+    msg_plain: str
+    msg_html: str
+    response: str
+
+
 class User_Input(BaseModel):
-    query : str = Field(description="The user's query")
+    query: str = Field(description="The user's query")
 
-#state
 class IntentResult(BaseModel):
     intent: Literal["email", "calendar", "general"] = Field(
         description="The primary intent of the user's request"
     )
 
-#node
-def intent(query: str) -> str:
+def classify_intent(query: str) -> Literal["email", "calendar", "general"]:
     system_message = """
     You are the intent classifier for LAPA, a personal AI assistant.
 
@@ -109,16 +108,11 @@ class EmailDraft(BaseModel):
         description="HTML version of the same email body"
     )
 
-class mail_dict(TypedDict):
-    sender: str
-    to: str
-    subject: str
-    msg_plain: str
-
-def email_details(query: User_Input, state: mail_dict) -> EmailDraft:
+def email_details(state: AssistantState) -> AssistantState:
     system_message = """
         Fields:
-        - sender: Use the authenticated sender provided in the state.
+        - sender: Use the authenticated sender provided in the state. If it is
+          missing, leave it empty; never infer it from the request.
         - to: Extract the recipient email address if provided.
         - subject: Extract the requested subject, or create a concise
           subject if the user requests an email but provides none.
@@ -133,30 +127,67 @@ def email_details(query: User_Input, state: mail_dict) -> EmailDraft:
         5. Do not send the email.
     """
 
+    sender = state.get("sender", "")
     result = llm.with_structured_output(
         EmailDraft
     ).invoke([
         SystemMessage(content=system_message),
-        HumanMessage(content=query.query),
+        HumanMessage(content=f"Authenticated sender: {sender}\n\nRequest: {state['query']}"),
     ])
-    
+
     return {
-        "sender": state["sender"],
+        "sender": sender,
         "to": result.to,
         "subject": result.subject,
-        "msg_plain": result.msg_plain
+        "msg_plain": result.msg_plain,
+        "msg_html": result.msg_html,
     }
 
-chain = StateGraph(User_Input)
-chain.add_node("intent", intent)
-chain.add_node("email_details", email_details)
-chain.add_edge(START, "intent")
-chain.add_conditional_edges("intent", intent,{"email" : "email_details"})
-chain.add_edge("email_details", END)
 
-chain = chain.compile()
-# import matplotlib.pyplot as plt
-# plt.figure(figsize=(20, 20))    
-# display.imshow(Image(chain.get_graph().draw_mermaid_png()))
+def route_intent(state: AssistantState) -> Literal["email", "calendar", "general"]:
+    """Choose the next node from the intent stored by the classifier."""
+    return state["intent"]
 
-chain.invoke({"query" : "Write a mail to arvind@gmail.com to remind him about tommorow's meeting from me my mail is advaitkale9@gmail.com"})j
+
+def calendar_request(state: AssistantState) -> AssistantState:
+    """Placeholder for the calendar integration, which is not wired yet."""
+    return {
+        "response": (
+            "I recognized this as a calendar request, but calendar actions "
+            "are not connected yet."
+        )
+    }
+
+
+def general_response(state: AssistantState) -> AssistantState:
+    result = llm.invoke([HumanMessage(content=state["query"])])
+    return {"response": str(result.content)}
+
+
+def build_graph():
+    workflow = StateGraph(AssistantState)
+    workflow.add_node(
+        "classify_intent",
+        lambda state: {"intent": classify_intent(state["query"])},
+    )
+    workflow.add_node("email_details", email_details)
+    workflow.add_node("calendar_request", calendar_request)
+    workflow.add_node("general_response", general_response)
+
+    workflow.add_edge(START, "classify_intent")
+    workflow.add_conditional_edges(
+        "classify_intent",
+        route_intent,
+        {
+            "email": "email_details",
+            "calendar": "calendar_request",
+            "general": "general_response",
+        },
+    )
+    workflow.add_edge("email_details", END)
+    workflow.add_edge("calendar_request", END)
+    workflow.add_edge("general_response", END)
+    return workflow.compile()
+
+
+chain = build_graph()
